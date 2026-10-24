@@ -1,0 +1,31 @@
+Environment variables and secrets
+
+.env
+.env.*
+
+Python virtual environment
+
+agent_env/
+venv/
+.venv/
+
+Python cache
+
+__pycache__/
+*.py[cod]
+
+Test and development cache
+
+.pytest_cache/
+.ipynb_checkpoints/
+
+Runtime chat history
+
+chat_history.json
+chat_history.tmp
+
+Local logs
+
+*.log
+
+.vscode/
