@@ -1,47 +1,74 @@
 import os
 import copy
 import json
-from pathlib import Path
+import sqlite3
 
+from pathlib import Path
+from contextlib import closing
 from uuid import uuid4
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field
 import logging
+from logging.handlers import RotatingFileHandler
 
 from agent import Agent
+from config import API_KEY, MODEL_NAME, BASE_URL
 
-load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-HISTORY_FILE = Path(__file__).with_name("chat_history.json")
-temp_path = HISTORY_FILE.with_suffix(".tmp")
+
+DB_FILE = Path(__file__).with_name("chat_history.db")
 
 
-def load_histories():
-    if not HISTORY_FILE.exists():
-        return {}
+def init_db():
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        with conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_histories (
+                    session_id TEXT PRIMARY KEY,
+                    messages TEXT NOT NULL
+                )
+            """)
 
-    with HISTORY_FILE.open("r", encoding="utf-8") as f:
-        return json.load(f)
+
+init_db()
 
 
-def save_histories(histories):
-    try:
-         # 在这里完成临时文件写入
-        with temp_path.open("w", encoding="utf-8") as f:
-            json.dump(histories, f, ensure_ascii=False, indent=2)
-        
-        # 文件成功关闭后，替换正式文件
-        os.replace(temp_path,HISTORY_FILE)
-        
-    except Exception :
-        # 记录错误日志
-        logger.exception("聊天历史保存失败")
-        #  重新抛出异常
-        raise
+def save_history(session_id, messages):
+    messages_json = json.dumps(messages, ensure_ascii=False)
+
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO chat_histories (session_id, messages)
+                VALUES (?, ?)
+                ON CONFLICT(session_id)
+                DO UPDATE SET messages = excluded.messages
+                """,
+                (session_id, messages_json),
+            )
+
+
+def load_history(session_id):
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        with conn:
+            row = conn.execute(
+                """
+                    SELECT session_id, messages
+                    FROM chat_histories 
+                    WHERE session_id=?
+                    """,
+                (session_id,),
+            ).fetchone()
+    if not row:
+        messages = []
+
+    else:
+        messages = json.loads(row[1])
+    return messages
 
 
 def serialize_messages(messages):
@@ -65,15 +92,13 @@ def serialize_messages(messages):
 
     return serialized
 
+
 app = FastAPI()
 
 client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com",
+    api_key=API_KEY,
+    base_url=BASE_URL,
 )
-
-histories = load_histories()
-agents = {}
 
 
 class ChatRequest(BaseModel):
@@ -86,32 +111,50 @@ def home():
     return {"message": "Agent API 已启动"}
 
 
+agents = {}
+
 
 @app.post("/chat")
 def chat(request: ChatRequest):
     try:
+
         session_id = request.session_id
 
         if not session_id:
             session_id = str(uuid4())
 
+        logger.info("收到聊天请求，session_id=%s", session_id)
+
+        history = load_history(session_id)
+
         if session_id not in agents:
-            agent = Agent(client=client,model="deepseek-chat")
+            agent = Agent(client=client, model=MODEL_NAME)
 
             # 恢复这个会话之前保存的消息
-            if session_id in histories:
-                agent.messages = copy.deepcopy(histories[session_id])
+            agent.messages = copy.deepcopy(history)
 
+            # 将新创建的 Agent 存入字典
             agents[session_id] = agent
 
         agent = agents[session_id]
 
+        # 备份本轮执行前的消息历史
+        old_messages = copy.deepcopy(agent.messages)
+
         # 执行当前用户的问题
         answer = agent.run(request.question)
 
+        logger.info("Agent 执行成功，session_id=%s", session_id)
+
         # 保存当前会话的完整历史
-        histories[session_id] = serialize_messages(agent.messages)
-        save_histories(histories)
+        history = serialize_messages(agent.messages)
+
+        try:
+            save_history(session_id, history)
+            logger.info("聊天历史保存成功，session_id=%s", session_id)
+        except Exception:
+            agent.messages = old_messages
+            raise
 
         return {
             "answer": answer,
@@ -126,7 +169,6 @@ def chat(request: ChatRequest):
         )
 
 
-
 if __name__ == "__main__":
     import uvicorn
 
@@ -136,4 +178,3 @@ if __name__ == "__main__":
         port=8000,
         reload=True,
     )
-    

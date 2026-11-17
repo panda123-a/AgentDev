@@ -29,3 +29,11 @@ Local logs
 *.log
 
 .vscode/
+
+# SQLite database
+*.db
+
+# Python packaging
+dist/
+build/
+*.egg-info/
